@@ -3,34 +3,49 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI 驾驶行为深度分析仪</title>
+    <title>AI 驾驶分析 - 优化版</title>
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@latest"></script>
     <style>
-        :root { --danger: #ff3333; --safe: #00ff00; }
-        body { margin: 0; background: #0a0a0a; color: #fff; font-family: 'PingFang SC', sans-serif; }
-        
+        body { margin: 0; background: #000; color: #fff; font-family: -apple-system, monospace; overflow: hidden; }
         #layout { display: flex; flex-direction: column; height: 100vh; }
-        #viewer { position: relative; flex: 1; background: #000; overflow: hidden; display: flex; justify-content: center; }
-        video { width: 100%; height: 100%; object-fit: contain; }
-        canvas#renderCanvas { position: absolute; width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
-
-        #controls { padding: 20px; background: #1a1a1a; border-top: 2px solid #333; }
         
-        /* 热力进度条 */
-        #timeline-wrapper { position: relative; width: 100%; height: 50px; background: #222; border-radius: 6px; cursor: pointer; margin-bottom: 15px; border: 1px solid #444; }
-        #safety-bar { width: 100%; height: 100%; border-radius: 4px; }
-        #playhead { position: absolute; top: 0; width: 3px; height: 100%; background: #fff; box-shadow: 0 0 8px #fff; pointer-events: none; transition: left 0.1s linear; }
+        #top-monitor { 
+            height: 60px; background: rgba(20, 20, 20, 0.95); 
+            border-bottom: 2px solid #444; display: flex; 
+            align-items: center; padding: 0 20px; gap: 15px;
+            font-size: 14px; overflow-x: auto; white-space: nowrap;
+        }
+        .zone-tag { padding: 4px 12px; border-radius: 12px; font-weight: bold; animation: fadeIn 0.3s; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; } }
+        .tag-danger { color: #fff; background: #ff3333; }
+        .tag-warning { color: #000; background: #ffaa00; }
+        .tag-safe { color: #000; background: #00ff00; }
 
-        .toolbar { display: flex; gap: 15px; align-items: center; }
-        .upload-btn { background: #007aff; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: bold; }
-        #status { font-size: 13px; color: #888; }
+        #viewer { position: relative; flex: 1; background: #000; overflow: hidden; }
+        video, canvas { position: absolute; width: 100%; height: 100%; object-fit: contain; }
+
+        #controls { padding: 15px; background: #1a1a1a; border-top: 1px solid #333; }
+        #timeline-wrapper { position: relative; width: 100%; height: 50px; background: #222; border-radius: 8px; cursor: pointer; margin-bottom: 15px; overflow: hidden; }
+        #safety-bar { width: 100%; height: 100%; display: block; }
+        #playhead { position: absolute; top: 0; width: 3px; height: 100%; background: #fff; box-shadow: 0 0 10px rgba(255,255,255,0.5); pointer-events: none; transition: left 0.1s linear; }
+        
+        .upload-btn { background: #007aff; padding: 10px 24px; border-radius: 6px; cursor: pointer; display: inline-block; font-weight: 600; }
+        .upload-btn:hover { background: #0051d5; }
         input[type="file"] { display: none; }
+        
+        #status { margin-left: 15px; color: #888; font-size: 13px; }
+        .perf-stats { float: right; color: #666; font-size: 12px; }
     </style>
 </head>
 <body>
 
 <div id="layout">
+    <div id="top-monitor">
+        <span style="color:#666">当前状态:</span>
+        <div id="tagContainer" style="display:flex; gap:10px;"></div>
+    </div>
+
     <div id="viewer">
         <video id="videoSource" playsinline muted></video>
         <canvas id="renderCanvas"></canvas>
@@ -41,12 +56,10 @@
             <canvas id="safety-bar"></canvas>
             <div id="playhead" style="left: 0%"></div>
         </div>
-        
-        <div class="toolbar">
-            <label class="upload-btn" for="fileInput">导入记录仪素材</label>
-            <input type="file" id="fileInput" accept="video/*">
-            <div id="status">等待载入模型...</div>
-        </div>
+        <label class="upload-btn" for="fileInput">上传视频分析</label>
+        <input type="file" id="fileInput" accept="video/*">
+        <span id="status">等待模型加载...</span>
+        <span class="perf-stats" id="perfStats"></span>
     </div>
 </div>
 
@@ -54,170 +67,208 @@
     const video = document.getElementById('videoSource');
     const canvas = document.getElementById('renderCanvas');
     const ctx = canvas.getContext('2d');
+    const tagContainer = document.getElementById('tagContainer');
     const safetyBar = document.getElementById('safety-bar');
     const sCtx = safetyBar.getContext('2d');
-    const status = document.getElementById('status');
-    const playhead = document.getElementById('playhead');
-
+    const statusEl = document.getElementById('status');
+    const perfEl = document.getElementById('perfStats');
+    
     let model = null;
-    let hoodY = 0; // 自动检测到的机盖/挡风边界高度
-    let analysisMap = new Map(); // 存储已分析帧的结果 {time: {ttc, detections}}
+    let isAnalyzing = false;
+    let analysisData = []; // 改为数组，支持seek
+    let lastDetectionTime = 0;
+    const DETECTION_INTERVAL = 150; // 150ms一帧（约6-7fps）
+    
+    // TTC 区间定义
+    function getZone(ttc) {
+        if (ttc <= 1.5) return { label: "危险", color: "#ff3333", class: "tag-danger", level: 0 };
+        if (ttc <= 3.5) return { label: "紧迫", color: "#ffaa00", class: "tag-warning", level: 1 };
+        if (ttc <= 6.0) return { label: "注意", color: "#00ff00", class: "tag-safe", level: 2 };
+        return { label: "安全", color: "#00ccff", class: "tag-safe", level: 3 };
+    }
 
-    async function initModel() {
+    async function init() {
+        statusEl.innerText = "加载AI模型...";
         model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
-        status.innerText = "模型就绪，请上传视频";
+        statusEl.innerText = "模型就绪，请选择视频";
     }
 
-    // 1. 自动检测本车边界 (挡风玻璃/机盖线)
-    function detectHoodLine() {
-        const tempCanvas = document.createElement('canvas');
-        tempCanvas.width = video.videoWidth;
-        tempCanvas.height = video.videoHeight;
-        const tCtx = tempCanvas.getContext('2d');
-        tCtx.drawImage(video, 0, 0);
-        
-        // 取画面底部30%进行边缘分析
-        const scanStart = Math.floor(video.videoHeight * 0.7);
-        const imgData = tCtx.getImageData(0, scanStart, video.videoWidth, video.videoHeight - scanStart);
-        
-        // 简化的边缘查找：寻找水平连续的高对比度区域
-        // 这里默认设定一个经验值，并根据画面进行微调
-        hoodY = video.videoHeight * 0.88; 
-        console.log("检测到本车基准线高度:", hoodY);
-    }
-
-    document.getElementById('fileInput').onchange = async (e) => {
+    document.getElementById('fileInput').onchange = (e) => {
         const file = e.target.files[0];
         if (!file) return;
         
         video.src = URL.createObjectURL(file);
-        status.innerText = "预处理中，请稍候...";
-        
-        video.onloadedmetadata = async () => {
+        video.onloadedmetadata = () => {
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
-            safetyBar.width = safetyBar.offsetWidth;
-            safetyBar.height = safetyBar.offsetHeight;
-            
-            detectHoodLine();
-            startSmartAnalysis();
+            resizeSafetyBar();
+            analysisData = []; // 清空历史
+            video.play();
+            isAnalyzing = true;
+            analyzeLoop();
         };
+        
+        // 监听seeking事件（用户拖动进度条）
+        video.addEventListener('seeking', () => {
+            // 可以在这里暂停分析或调整数据索引
+        });
     };
 
-    // 2. 预处理逻辑：领先播放进度进行扫描
-    async function startSmartAnalysis() {
-        video.play();
+    function resizeSafetyBar() {
+        safetyBar.width = safetyBar.offsetWidth;
+        safetyBar.height = safetyBar.offsetHeight;
+        // 重绘已有数据
+        redrawTimeline();
+    }
+
+    async function analyzeLoop() {
+        if (!isAnalyzing || video.ended) return;
         
-        // 渲染循环
-        const renderLoop = () => {
-            if (video.ended) return;
-            drawFrame();
-            requestAnimationFrame(renderLoop);
-        };
-        renderLoop();
-
-        // 分析逻辑 (尽可能快地跑)
-        while(!video.ended) {
-            if (video.paused) { await new Promise(r => setTimeout(r, 500)); continue; }
-            
-            const currentTime = video.currentTime;
-            // 如果已经分析到了 6秒 之后，或者已经到结尾，稍作停顿
-            if (analysisMap.has(currentTime.toFixed(1))) {
-                await new Promise(r => setTimeout(r, 100));
-                continue;
-            }
-
+        const now = performance.now();
+        let frameData = null;
+        
+        // 控制检测频率
+        if (now - lastDetectionTime > DETECTION_INTERVAL) {
+            const startDetect = performance.now();
             const predictions = await model.detect(video);
-            processDetections(currentTime, predictions);
+            const detectTime = Math.round(performance.now() - startDetect);
             
-            // 实时更新进度条颜色
-            updateTimeline();
+            frameData = processFrame(predictions, video.currentTime);
+            lastDetectionTime = now;
+            
+            // 更新性能统计
+            perfEl.innerText = `检测耗时: ${detectTime}ms | 帧率: ${Math.round(1000/DETECTION_INTERVAL)}fps`;
         }
+        
+        // 每帧都更新UI（流畅）
+        drawUI();
+        
+        requestAnimationFrame(analyzeLoop);
     }
 
-    function processDetections(time, predictions) {
-        let minTTC = 99;
-        const processed = predictions.filter(p => ['car', 'truck', 'bus'].includes(p.class)).map(p => {
-            const [x, y, w, h] = p.bbox;
-            const bottomY = y + h;
-            const centerX = x + w/2;
-            
-            // TTC 计算逻辑
-            // 距离基准线的像素距离
-            const pixelDist = hoodY - bottomY;
-            // 简单的透视估算：基于框体大小和位置变化
-            let ttc = pixelDist / (h * 0.5); // 模拟速度向量
-            if (ttc < 0) ttc = 99;
-
-            const isCenter = Math.abs(centerX - canvas.width/2) < canvas.width * 0.2;
-            if (isCenter && ttc < minTTC) minTTC = ttc;
-
-            return { bbox: p.bbox, ttc, isCenter };
-        });
-
-        analysisMap.set(time.toFixed(1), { ttc: minTTC, items: processed });
+    function processFrame(predictions, currentTime) {
+        const hoodLine = canvas.height * 0.85;
+        
+        // 找到同车道最近的车辆
+        const cars = predictions
+            .filter(p => ['car', 'truck', 'bus'].includes(p.class))
+            .map(p => {
+                const [x, y, w, h] = p.bbox;
+                const centerX = x + w/2;
+                const isCenter = Math.abs(centerX - canvas.width/2) < canvas.width * 0.3;
+                const groundY = y + h;
+                const dist = hoodLine - groundY;
+                
+                // 改进的TTC估算：基于像素高度反比（假设车高恒定）
+                // 距离越远车框越小，ttc越大
+                let ttc = (canvas.height * 0.5) / h * 2; // 粗略估算
+                if (dist < 0) ttc = 0; // 已经过线
+                
+                return { 
+                    bbox: p.bbox, 
+                    ttc: isCenter ? ttc : 99,
+                    isCenter,
+                    color: getZone(ttc).color
+                };
+            })
+            .sort((a, b) => a.ttc - b.ttc); // 按危险程度排序
+        
+        const frameInfo = {
+            time: currentTime,
+            cars: cars,
+            minTTC: cars.length > 0 ? cars[0].ttc : 99
+        };
+        
+        // 存储（限制数组大小防止内存泄漏）
+        analysisData.push(frameInfo);
+        if (analysisData.length > 2000) analysisData.shift();
+        
+        // 更新时间轴（只画当前点）
+        updateTimeline(currentTime, frameInfo.minTTC);
+        
+        return frameInfo;
     }
 
-    // 3. 画面渲染
-    function drawFrame() {
-        const timeKey = video.currentTime.toFixed(1);
-        const data = analysisMap.get(timeKey);
+    function drawUI() {
+        // 找到当前时间最近的数据
+        const current = analysisData.reduce((prev, curr) => 
+            Math.abs(curr.time - video.currentTime) < Math.abs(prev.time - video.currentTime) ? curr : prev
+        , analysisData[analysisData.length-1] || {cars:[]});
         
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        playhead.style.left = (video.currentTime / video.duration * 100) + "%";
+        tagContainer.innerHTML = '';
 
-        // 绘制基准线
-        ctx.strokeStyle = 'rgba(255,255,255,0.3)';
-        ctx.setLineDash([5, 5]);
-        ctx.beginPath(); ctx.moveTo(0, hoodY); ctx.lineTo(canvas.width, hoodY); ctx.stroke();
-        ctx.setLineDash([]);
+        // 只显示同车道车辆
+        const centerCars = current.cars.filter(c => c.isCenter);
+        
+        if (centerCars.length === 0) {
+            const tag = document.createElement('div');
+            tag.className = 'zone-tag';
+            tag.style.background = '#333';
+            tag.style.color = '#888';
+            tag.innerText = '未检测到前方车辆';
+            tagContainer.appendChild(tag);
+        } else {
+            centerCars.forEach(car => {
+                const [x, y, w, h] = car.bbox;
+                const zone = getZone(car.ttc);
+                
+                // 画框
+                ctx.strokeStyle = zone.color;
+                ctx.lineWidth = 3;
+                ctx.strokeRect(x, y, w, h);
+                
+                // 标签背景
+                ctx.fillStyle = zone.color;
+                ctx.fillRect(x, y - 28, 120, 24);
+                ctx.fillStyle = '#000';
+                ctx.font = 'bold 16px Arial';
+                ctx.fillText(`${zone.label} ${car.ttc.toFixed(1)}s`, x + 5, y - 10);
+                
+                // 顶部标签（只显示最危险的）
+                if (car === centerCars[0]) {
+                    const tag = document.createElement('div');
+                    tag.className = `zone-tag ${zone.class}`;
+                    tag.innerText = `前方车辆 ${zone.label} (${car.ttc.toFixed(1)}秒)`;
+                    tagContainer.appendChild(tag);
+                }
+            });
+        }
 
-        if (!data) return;
-
-        data.items.forEach(item => {
-            const [x, y, w, h] = item.bbox;
-            const isDanger = item.isCenter && item.ttc < 3;
-            
-            // 颜色切换
-            const color = isDanger ? '#ff3333' : '#00ff00';
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 4;
-            ctx.strokeRect(x, y, w, h);
-
-            // 绘制文字标记
-            ctx.fillStyle = color;
-            ctx.font = "bold 24px Arial";
-            ctx.fillText(`${item.ttc.toFixed(1)}s`, x, y - 10);
-        });
+        // 更新播放头位置
+        const progress = (video.currentTime / video.duration) * 100;
+        document.getElementById('playhead').style.left = progress + "%";
     }
 
-    // 4. 更新热力进度条
-    function updateTimeline() {
-        sCtx.clearRect(0,0, safetyBar.width, safetyBar.height);
-        const sortedKeys = Array.from(analysisMap.keys()).sort((a,b) => a-b);
+    function updateTimeline(time, minTTC) {
+        const duration = video.duration;
+        if (!duration || duration === Infinity) return;
         
-        const cellWidth = safetyBar.width / (video.duration * 10); // 0.1秒一格
+        const x = (time / duration) * safetyBar.width;
+        const zone = getZone(minTTC);
         
-        sortedKeys.forEach(key => {
-            const data = analysisMap.get(key);
-            const x = (parseFloat(key) / video.duration) * safetyBar.width;
-            sCtx.fillStyle = data.ttc < 3 ? '#ff3333' : '#00ff00';
-            sCtx.fillRect(x, 0, cellWidth + 1, safetyBar.height);
-        });
-
-        // 更新状态文字
-        const lastAnalyzed = sortedKeys[sortedKeys.length-1] || 0;
-        status.innerText = `已分析至: ${lastAnalyzed}s / 总长: ${video.duration.toFixed(1)}s`;
+        // 画这一时间段的颜色段
+        const segmentWidth = (DETECTION_INTERVAL / 1000) / duration * safetyBar.width + 1;
+        sCtx.fillStyle = zone.color;
+        sCtx.fillRect(x, 0, segmentWidth, safetyBar.height);
     }
 
-    // 点击跳转
-    document.getElementById('timeline-wrapper').onclick = (e) => {
-        const rect = e.currentTarget.getBoundingClientRect();
-        const percent = (e.clientX - rect.left) / rect.width;
-        video.currentTime = percent * video.duration;
-    };
+    function redrawTimeline() {
+        sCtx.clearRect(0, 0, safetyBar.width, safetyBar.height);
+        analysisData.forEach(d => updateTimeline(d.time, d.minTTC));
+    }
 
-    initModel();
+    // 时间轴点击跳转
+    document.getElementById('timeline-wrapper').addEventListener('click', (e) => {
+        const rect = safetyBar.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const ratio = x / rect.width;
+        video.currentTime = ratio * video.duration;
+    });
+
+    window.addEventListener('resize', resizeSafetyBar);
+    
+    init();
 </script>
 </body>
 </html>
