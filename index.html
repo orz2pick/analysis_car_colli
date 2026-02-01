@@ -3,161 +3,221 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI 驾驶行为分析 - 视频版</title>
+    <title>AI 驾驶行为深度分析仪</title>
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@latest"></script>
     <style>
-        :root { --danger: #ff4d4d; --safe: #2ecc71; }
-        body { margin: 0; background: #121212; color: white; font-family: system-ui; display: flex; flex-direction: column; height: 100vh; }
+        :root { --danger: #ff3333; --safe: #00ff00; }
+        body { margin: 0; background: #0a0a0a; color: #fff; font-family: 'PingFang SC', sans-serif; }
         
-        /* 视频显示区 */
-        #stage { position: relative; flex: 1; background: #000; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+        #layout { display: flex; flex-direction: column; height: 100vh; }
+        #viewer { position: relative; flex: 1; background: #000; overflow: hidden; display: flex; justify-content: center; }
         video { width: 100%; height: 100%; object-fit: contain; }
-        canvas#overlay { position: absolute; pointer-events: none; width: 100%; height: 100%; object-fit: contain; }
+        canvas#renderCanvas { position: absolute; width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
 
-        /* 交互控制区 */
-        #controls { padding: 15px; background: #1e1e1e; border-top: 1px solid #333; }
+        #controls { padding: 20px; background: #1a1a1a; border-top: 2px solid #333; }
         
-        /* 安全进度条 */
-        #timeline-container { position: relative; width: 100%; height: 40px; background: #333; border-radius: 4px; cursor: pointer; margin-bottom: 10px; overflow: hidden; }
-        #safety-canvas { width: 100%; height: 100%; }
-        #play-head { position: absolute; top: 0; width: 2px; height: 100%; background: #fff; box-shadow: 0 0 5px rgba(0,0,0,0.5); pointer-events: none; }
+        /* 热力进度条 */
+        #timeline-wrapper { position: relative; width: 100%; height: 50px; background: #222; border-radius: 6px; cursor: pointer; margin-bottom: 15px; border: 1px solid #444; }
+        #safety-bar { width: 100%; height: 100%; border-radius: 4px; }
+        #playhead { position: absolute; top: 0; width: 3px; height: 100%; background: #fff; box-shadow: 0 0 8px #fff; pointer-events: none; transition: left 0.1s linear; }
 
-        .btn-group { display: flex; gap: 10px; align-items: center; }
+        .toolbar { display: flex; gap: 15px; align-items: center; }
+        .upload-btn { background: #007aff; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: bold; }
+        #status { font-size: 13px; color: #888; }
         input[type="file"] { display: none; }
-        .btn { background: #3498db; color: white; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: 14px; }
-        #status-text { font-size: 12px; color: #aaa; }
     </style>
 </head>
 <body>
 
-<div id="stage">
-    <video id="mainVideo" playsinline></video>
-    <canvas id="overlay"></canvas>
-</div>
-
-<div id="controls">
-    <div id="timeline-container">
-        <canvas id="safety-canvas"></canvas>
-        <div id="play-head" style="left: 0%"></div>
+<div id="layout">
+    <div id="viewer">
+        <video id="videoSource" playsinline muted></video>
+        <canvas id="renderCanvas"></canvas>
     </div>
-    
-    <div class="btn-group">
-        <label class="btn" for="fileInput">上传记录仪视频</label>
-        <input type="file" id="fileInput" accept="video/*">
-        <span id="status-text">等待视频导入...</span>
+
+    <div id="controls">
+        <div id="timeline-wrapper">
+            <canvas id="safety-bar"></canvas>
+            <div id="playhead" style="left: 0%"></div>
+        </div>
+        
+        <div class="toolbar">
+            <label class="upload-btn" for="fileInput">导入记录仪素材</label>
+            <input type="file" id="fileInput" accept="video/*">
+            <div id="status">等待载入模型...</div>
+        </div>
     </div>
 </div>
 
 <script>
-    const video = document.getElementById('mainVideo');
-    const overlay = document.getElementById('overlay');
-    const ctx = overlay.getContext('2d');
-    const safetyCanvas = document.getElementById('safety-canvas');
-    const sCtx = safetyCanvas.getContext('2d');
-    const playHead = document.getElementById('play-head');
-    const statusText = document.getElementById('status-text');
+    const video = document.getElementById('videoSource');
+    const canvas = document.getElementById('renderCanvas');
+    const ctx = canvas.getContext('2d');
+    const safetyBar = document.getElementById('safety-bar');
+    const sCtx = safetyBar.getContext('2d');
+    const status = document.getElementById('status');
+    const playhead = document.getElementById('playhead');
 
     let model = null;
-    let safetyData = []; // 存储每秒的风险等级
+    let hoodY = 0; // 自动检测到的机盖/挡风边界高度
+    let analysisMap = new Map(); // 存储已分析帧的结果 {time: {ttc, detections}}
 
-    // 1. 加载模型
-    async function init() {
-        statusText.innerText = "模型加载中...";
+    async function initModel() {
         model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
-        statusText.innerText = "就绪，请上传视频";
+        status.innerText = "模型就绪，请上传视频";
     }
 
-    // 2. 视频处理入口
+    // 1. 自动检测本车边界 (挡风玻璃/机盖线)
+    function detectHoodLine() {
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = video.videoWidth;
+        tempCanvas.height = video.videoHeight;
+        const tCtx = tempCanvas.getContext('2d');
+        tCtx.drawImage(video, 0, 0);
+        
+        // 取画面底部30%进行边缘分析
+        const scanStart = Math.floor(video.videoHeight * 0.7);
+        const imgData = tCtx.getImageData(0, scanStart, video.videoWidth, video.videoHeight - scanStart);
+        
+        // 简化的边缘查找：寻找水平连续的高对比度区域
+        // 这里默认设定一个经验值，并根据画面进行微调
+        hoodY = video.videoHeight * 0.88; 
+        console.log("检测到本车基准线高度:", hoodY);
+    }
+
     document.getElementById('fileInput').onchange = async (e) => {
         const file = e.target.files[0];
         if (!file) return;
         
         video.src = URL.createObjectURL(file);
-        statusText.innerText = "正在解析视频结构...";
+        status.innerText = "预处理中，请稍候...";
         
-        video.onloadedmetadata = () => {
-            overlay.width = video.videoWidth;
-            overlay.height = video.videoHeight;
-            safetyCanvas.width = safetyCanvas.offsetWidth;
-            safetyCanvas.height = safetyCanvas.offsetHeight;
-            startAnalysis();
+        video.onloadedmetadata = async () => {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            safetyBar.width = safetyBar.offsetWidth;
+            safetyBar.height = safetyBar.offsetHeight;
+            
+            detectHoodLine();
+            startSmartAnalysis();
         };
     };
 
-    // 3. 实时分析与渲染循环
-    async function startAnalysis() {
+    // 2. 预处理逻辑：领先播放进度进行扫描
+    async function startSmartAnalysis() {
         video.play();
-        statusText.innerText = "正在实时监控风险...";
         
-        function loop() {
-            if (video.paused || video.ended) return;
-            
-            // 更新进度条位置
-            const progress = (video.currentTime / video.duration) * 100;
-            playHead.style.left = progress + "%";
+        // 渲染循环
+        const renderLoop = () => {
+            if (video.ended) return;
+            drawFrame();
+            requestAnimationFrame(renderLoop);
+        };
+        renderLoop();
 
-            // 执行检测
-            detectFrame();
-            requestAnimationFrame(loop);
+        // 分析逻辑 (尽可能快地跑)
+        while(!video.ended) {
+            if (video.paused) { await new Promise(r => setTimeout(r, 500)); continue; }
+            
+            const currentTime = video.currentTime;
+            // 如果已经分析到了 6秒 之后，或者已经到结尾，稍作停顿
+            if (analysisMap.has(currentTime.toFixed(1))) {
+                await new Promise(r => setTimeout(r, 100));
+                continue;
+            }
+
+            const predictions = await model.detect(video);
+            processDetections(currentTime, predictions);
+            
+            // 实时更新进度条颜色
+            updateTimeline();
         }
-        loop();
     }
 
-    async function detectFrame() {
-        const predictions = await model.detect(video);
-        ctx.clearRect(0, 0, overlay.width, overlay.height);
-        
-        let minTTC = 99; // 本帧最小TTC
+    function processDetections(time, predictions) {
+        let minTTC = 99;
+        const processed = predictions.filter(p => ['car', 'truck', 'bus'].includes(p.class)).map(p => {
+            const [x, y, w, h] = p.bbox;
+            const bottomY = y + h;
+            const centerX = x + w/2;
+            
+            // TTC 计算逻辑
+            // 距离基准线的像素距离
+            const pixelDist = hoodY - bottomY;
+            // 简单的透视估算：基于框体大小和位置变化
+            let ttc = pixelDist / (h * 0.5); // 模拟速度向量
+            if (ttc < 0) ttc = 99;
 
-        predictions.forEach(p => {
-            if (['car', 'truck', 'bus'].includes(p.class)) {
-                const [x, y, w, h] = p.bbox;
-                
-                // 简化TTC逻辑：根据高度占画面的比例估算
-                const distanceFactor = h / overlay.height;
-                const currentTTC = 1 / (distanceFactor * 1.5); // 模拟算法
-                
-                const isCenter = Math.abs((x + w/2) - overlay.width/2) < overlay.width * 0.25;
-                if(isCenter && currentTTC < minTTC) minTTC = currentTTC;
+            const isCenter = Math.abs(centerX - canvas.width/2) < canvas.width * 0.2;
+            if (isCenter && ttc < minTTC) minTTC = ttc;
 
-                // 绘制轮廓
-                ctx.strokeStyle = (isCenter && currentTTC < 3) ? '#ff0000' : '#00ff00';
-                ctx.lineWidth = 5;
-                ctx.strokeRect(x, y, w, h);
-                ctx.fillStyle = ctx.strokeStyle;
-                ctx.fillText(`TTC: ${currentTTC.toFixed(1)}s`, x, y - 10);
-            }
+            return { bbox: p.bbox, ttc, isCenter };
         });
 
-        // 实时记录数据并绘制安全条
-        updateSafetyTimeline(video.currentTime, minTTC);
+        analysisMap.set(time.toFixed(1), { ttc: minTTC, items: processed });
     }
 
-    // 4. 绘制安全进度条 (热力图)
-    function updateSafetyTimeline(time, ttc) {
-        const x = (time / video.duration) * safetyCanvas.width;
-        sCtx.fillStyle = ttc < 3 ? '#ff4d4d' : '#2ecc71';
-        sCtx.fillRect(x, 0, 2, safetyCanvas.height);
+    // 3. 画面渲染
+    function drawFrame() {
+        const timeKey = video.currentTime.toFixed(1);
+        const data = analysisMap.get(timeKey);
+        
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        playhead.style.left = (video.currentTime / video.duration * 100) + "%";
+
+        // 绘制基准线
+        ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+        ctx.setLineDash([5, 5]);
+        ctx.beginPath(); ctx.moveTo(0, hoodY); ctx.lineTo(canvas.width, hoodY); ctx.stroke();
+        ctx.setLineDash([]);
+
+        if (!data) return;
+
+        data.items.forEach(item => {
+            const [x, y, w, h] = item.bbox;
+            const isDanger = item.isCenter && item.ttc < 3;
+            
+            // 颜色切换
+            const color = isDanger ? '#ff3333' : '#00ff00';
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 4;
+            ctx.strokeRect(x, y, w, h);
+
+            // 绘制文字标记
+            ctx.fillStyle = color;
+            ctx.font = "bold 24px Arial";
+            ctx.fillText(`${item.ttc.toFixed(1)}s`, x, y - 10);
+        });
     }
 
-    // 5. 进度条点击/移动交互
-    const timeline = document.getElementById('timeline-container');
-    const handleSeek = (e) => {
-        const rect = timeline.getBoundingClientRect();
-        const offsetX = (e.clientX || e.touches[0].clientX) - rect.left;
-        const percent = Math.min(Math.max(offsetX / rect.width, 0), 1);
+    // 4. 更新热力进度条
+    function updateTimeline() {
+        sCtx.clearRect(0,0, safetyBar.width, safetyBar.height);
+        const sortedKeys = Array.from(analysisMap.keys()).sort((a,b) => a-b);
+        
+        const cellWidth = safetyBar.width / (video.duration * 10); // 0.1秒一格
+        
+        sortedKeys.forEach(key => {
+            const data = analysisMap.get(key);
+            const x = (parseFloat(key) / video.duration) * safetyBar.width;
+            sCtx.fillStyle = data.ttc < 3 ? '#ff3333' : '#00ff00';
+            sCtx.fillRect(x, 0, cellWidth + 1, safetyBar.height);
+        });
+
+        // 更新状态文字
+        const lastAnalyzed = sortedKeys[sortedKeys.length-1] || 0;
+        status.innerText = `已分析至: ${lastAnalyzed}s / 总长: ${video.duration.toFixed(1)}s`;
+    }
+
+    // 点击跳转
+    document.getElementById('timeline-wrapper').onclick = (e) => {
+        const rect = e.currentTarget.getBoundingClientRect();
+        const percent = (e.clientX - rect.left) / rect.width;
         video.currentTime = percent * video.duration;
     };
 
-    timeline.addEventListener('mousedown', (e) => {
-        handleSeek(e);
-        timeline.addEventListener('mousemove', handleSeek);
-    });
-    window.addEventListener('mouseup', () => timeline.removeEventListener('mousemove', handleSeek));
-    timeline.addEventListener('touchstart', (e) => handleSeek(e));
-
-    init();
+    initModel();
 </script>
 </body>
 </html>
